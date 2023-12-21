@@ -1,2 +1,4 @@
 chatgpt-venv/
 .env
+mysite/db.sqlite3
+__pycache__/
