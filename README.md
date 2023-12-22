@@ -8,6 +8,7 @@ python -m venv chatgpt-venv/
 pip install django
 pip install openai
 pip install socksio # allow to use proxy
+pip install python-dotenv
 ```
 
 Prepare `.env`:
