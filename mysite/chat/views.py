@@ -5,8 +5,11 @@ from django.views.decorators.csrf import csrf_exempt
 from .models import UserMessageCount
 from dotenv import load_dotenv
 from openai import OpenAI
+import os
 
-load_dotenv()
+env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '.env')
+load_dotenv(env_file)
+
 client = OpenAI()
 
 @csrf_exempt
