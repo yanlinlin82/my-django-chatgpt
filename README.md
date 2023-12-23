@@ -17,3 +17,9 @@ Prepare `.env`:
 OPENAI_API_KEY=xxxxxx
 ALL_PROXY=socks5://host:port
 ```
+
+## Debug
+
+```sh
+ssh -nNT -R *:8001:localhost:8000 yanlinlin.cn
+```
