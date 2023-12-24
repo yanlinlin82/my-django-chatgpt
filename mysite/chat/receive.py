@@ -13,6 +13,7 @@ def parse_xml(web_data, encrypt_type, encodingAESKey, expected_app_id):
     if encrypt_type == 'aes':
         if xmlData.find('Encrypt') != None:
             xmlData = decrypt_msg(encodingAESKey, xmlData.find('Encrypt').text, expected_app_id)
+            print('Decrypted XML: ', ET.tostring(xmlData, encoding='utf-8', method='xml'))
 
     msg_type_element = xmlData.find('MsgType')
     if msg_type_element is not None:

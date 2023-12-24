@@ -3,8 +3,6 @@ import base64
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
-import string
-import random
 import struct
 import socket
 import os
@@ -26,7 +24,6 @@ def encrypt_msg(plain_msg, token, timestamp, msg_signature, nonce, encodingAESKe
 
     # Concatenate everything as bytes
     text_bytes = msg_length_bytes + plain_msg_bytes + appId_bytes
-    text = text_bytes
 
     # Apply PKCS7 padding
     padder = padding.PKCS7(128).padder() # 128 bits = 16 bytes
