@@ -9,6 +9,7 @@ pip install django
 pip install openai
 pip install socksio # allow to use proxy
 pip install python-dotenv
+pip install cryptography
 ```
 
 Prepare `.env`:

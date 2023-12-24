@@ -7,10 +7,10 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import os
 import hashlib
-import xml.etree.ElementTree as ET
 import re
 from . import reply
 from . import receive
+import xml.etree.ElementTree as ET
 
 env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '.env')
 load_dotenv(env_file)
@@ -28,7 +28,8 @@ def contains_at_ai(text):
 @csrf_exempt
 def wx(request):
     try:
-        print('request.method = ', request.method)
+        print('==========================')
+        print('request = ', request)
 
         # Get data from request
         signature = request.GET.get('signature', '')
@@ -60,7 +61,11 @@ def wx(request):
                 print('web_data is empty')
                 return HttpResponse("success")
             print('web_data = ', web_data)
-            recMsg = receive.parse_xml(web_data)
+
+            encodingAESKey = os.getenv('WX_ENCODING_AES_KEY')
+            appId = os.getenv('WX_APP_ID')
+            recMsg = receive.parse_xml(web_data, encrypt_type, encodingAESKey, appId)
+
             if isinstance(recMsg, receive.Msg) and recMsg.MsgType == 'text':
                 toUser = recMsg.FromUserName
                 fromUser = recMsg.ToUserName
@@ -69,9 +74,19 @@ def wx(request):
                 if contains_at_ai(content):
                     content = content.replace('@AI', '')
                     response_msg = '（本条消息为基于AI的自动回复）\n\n' + get_chatgpt_response(content)
+                    #response_msg = '（本条消息为基于AI的自动回复）\n\n' + content
                     print('response_msg = ', response_msg)
                     replyMsg = reply.TextMsg(toUser, fromUser, response_msg)
                     return HttpResponse(replyMsg.send())
+                    #if encrypt_type == 'aes':
+                    #    replyText = reply.encrypt_msg(replyMsg.send(), token, timestamp, msg_signature, nonce, encodingAESKey, appId, toUser, fromUser)
+                    #    print(f'replyText (encrypted) = "{replyText}"')
+                    #    print('---------------')
+                    #    m = receive.parse_xml(replyText.encode('utf-8'), encrypt_type, encodingAESKey, appId)
+                    #    print('------------------, m.Content = ', m.Content.decode('utf-8'))
+                    #    return HttpResponse(replyText)
+                    #else:
+                    #    return HttpResponse(replyMsg.send())
                 else:
                     print("暂且不处理 (不带有@AI)")
                     return HttpResponse("success")
