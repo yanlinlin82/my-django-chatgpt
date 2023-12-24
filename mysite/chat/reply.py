@@ -28,14 +28,9 @@ def encrypt_msg(plain_msg, token, timestamp, msg_signature, nonce, encodingAESKe
     text_bytes = msg_length_bytes + plain_msg_bytes + appId_bytes
     text = text_bytes
 
-    # 对需要加密的明文进行填充补位
-    block_size = 32
-    text_length = len(text)
-    amount_to_pad = block_size - (text_length % block_size)
-    if amount_to_pad == 0:
-        amount_to_pad = block_size
-    pad = chr(amount_to_pad)
-    text = text + (pad * amount_to_pad).encode('utf-8')
+    # Apply PKCS7 padding
+    padder = padding.PKCS7(128).padder() # 128 bits = 16 bytes
+    padded_data = padder.update(text_bytes) + padder.finalize()
 
     # Initialize the backend and cipher
     iv = os.urandom(16)  # AES block size is 16 bytes, ensure this matches your requirement
@@ -43,7 +38,7 @@ def encrypt_msg(plain_msg, token, timestamp, msg_signature, nonce, encodingAESKe
     encryptor = cipher.encryptor()
 
     # Encrypt the padded message
-    encrypted = encryptor.update(text) + encryptor.finalize()
+    encrypted = encryptor.update(padded_data) + encryptor.finalize()
     b64_encrypted = base64.b64encode(iv + encrypted).decode('utf-8')
 
     AES_TEXT_RESPONSE_TEMPLATE = """<xml>
@@ -58,13 +53,13 @@ def encrypt_msg(plain_msg, token, timestamp, msg_signature, nonce, encodingAESKe
 <Nonce><![CDATA[%(nonce)s]]></Nonce>
 </xml>"""
     resp_dict = {
-        'toUserName'   : toUserName,
-        'fromUserName' : fromUserName,
-        'CreateTime'   : timestamp,
-        'msg_encrypt' : b64_encrypted,
+        'toUserName'    : toUserName,
+        'fromUserName'  : fromUserName,
+        'CreateTime'    : timestamp,
+        'msg_encrypt'   : b64_encrypted,
         'msg_signaturet': msg_signature,
-        'timestamp'    : timestamp,
-        'nonce'        : nonce,
+        'timestamp'     : timestamp,
+        'nonce'         : nonce,
         }
     resp_xml = AES_TEXT_RESPONSE_TEMPLATE % resp_dict
     return resp_xml
