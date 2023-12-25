@@ -10,30 +10,20 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
 from openai import OpenAI
+from django.contrib.auth.models import User
+from django.db import transaction
+from .models import UserProfile, ChatHistory
 
 pattern = r'@AI\b'
 
 class Handler:
-    def __init__(self, request) -> None:
+    def __init__(self) -> None:
         self.client = OpenAI()
 
-        print('==========================')
-        print('request = ', request)
-
-        self.token = os.getenv('WX_TOKEN')
-
-        self.signature = request.GET.get('signature', '')
-        self.timestamp = request.GET.get('timestamp', '')
-        self.nonce = request.GET.get('nonce', '')
-        self.echostr = request.GET.get('echostr', '')
-
-        self.openid = request.GET.get('openid', '')
-        self.encrypt_type = request.GET.get('encrypt_type', '')
-        self.msg_signature = request.GET.get('msg_signature', '')
-
-    def check(self):
+    @staticmethod
+    def verify(token, timestamp, nonce, signature):
         # Build list and sort it
-        data_list = [self.token, self.timestamp, self.nonce]
+        data_list = [token, timestamp, nonce]
         data_list.sort()
 
         # Concatenate list and hash it
@@ -41,36 +31,91 @@ class Handler:
         sha1.update(''.join(data_list).encode('utf-8'))  # Update with concatenated string
         hashcode = sha1.hexdigest()
 
-        if self.signature != hashcode:
-            print(f"Unmatched signature: expected '{hashcode}', got '{self.signature}'")
-        return hashcode == self.signature
+        if signature != hashcode:
+            print(f"Unmatched signature: expected '{hashcode}', got '{signature}'")
+            return False
+        return True
 
-    def process_post(self, web_data):
-        if len(web_data) == 0:
+    def process_post(self, request):
+        print('===== process_post() =====')
+
+        token = os.getenv('WX_TOKEN')
+
+        signature = request.GET.get('signature', '')
+        timestamp = request.GET.get('timestamp', '')
+        nonce = request.GET.get('nonce', '')
+        echostr = request.GET.get('echostr', '')
+
+        openid = request.GET.get('openid', '')
+
+        encrypt_type = request.GET.get('encrypt_type', '')
+        msg_signature = request.GET.get('msg_signature', '')
+
+        if not self.verify(token, timestamp, nonce, signature):
             return ''
-        print('web_data = ', web_data)
 
-        encodingAESKey = os.getenv('WX_ENCODING_AES_KEY')
-        appId = os.getenv('WX_APP_ID')
-        recMsg = self.parse_xml(web_data, self.encrypt_type, encodingAESKey, appId)
+        if request.method != 'POST':
+            return echostr
+    
+        in_msg = Handler.parse_msg_xml(request.body, encrypt_type)
+        if in_msg is None:
+            return ''
+        print('msg = ', in_msg)
 
-        if isinstance(recMsg, Msg) and recMsg.MsgType == 'text':
-            toUser = recMsg.FromUserName
-            fromUser = recMsg.ToUserName
-            content = recMsg.Content.decode('utf-8')
-            print('content = ', content)
-            if self.is_asking_chatgpt(content):
-                content = re.sub(pattern, '', content, flags=re.IGNORECASE)
-                response_msg = '（本条消息为基于AI的自动回复）\n\n' + self.get_chatgpt_response(content)
-                print('response_msg = ', response_msg)
-                replyMsg = TextMsg(toUser, fromUser, response_msg)
-                return replyMsg.send()
-            else:
-                print("暂且不处理 (不带有@AI)")
-                return ''
-        else:
+        if in_msg.msgType != 'text':
             print("暂且不处理 (非文本消息)")
             return ''
+
+        try:
+            with transaction.atomic():
+                user, created = User.objects.get_or_create(username=in_msg.fromUser)
+                if created:
+                    user.save()
+
+                user_profile, created = UserProfile.objects.get_or_create(user=user, openid=openid)
+                if created:
+                    user_profile.save()
+
+                chat_history_list = ChatHistory.objects.filter(user=user_profile, message_id=in_msg.msgId)
+                if len(chat_history_list) > 0:
+                    chat_history = chat_history_list[0]
+                    print("收到重复消息，使用历史记录中的回复")
+                    if chat_history.response_body is None:
+                        print("历史记录中的回复为空，暂且不处理")
+                        return ''
+                else:
+                    in_content = in_msg.content
+                    if not self.is_asking_chatgpt(in_content):
+                        print("暂且不处理 (不带有@AI)")
+                        return ''
+                    in_content = re.sub(pattern, '', in_content, flags=re.IGNORECASE)
+                    out_content = '（本条消息为基于AI的自动回复）\n\n' + self.get_chatgpt_response(in_content)
+                    print('out_content = ', out_content)
+
+                    chat_history = ChatHistory(
+                        user=user_profile,
+                        request_body=request.body,
+                        decrypted_request_body=in_msg.to_xml_str(),
+                        response_body=out_content,
+                        to_user=in_msg.toUser,
+                        from_user=in_msg.fromUser,
+                        create_time=in_msg.createTime,
+                        message_type=in_msg.msgType,
+                        content=in_msg.content,
+                        message_id=in_msg.msgId,
+                        role='user')
+                    chat_history.save()
+        except Exception as e:
+            print(f'WX-Handler Exception: {e}')
+            pass
+
+        out_msg = TextMsg(
+            toUser=in_msg.fromUser,
+            fromUser=in_msg.toUser,
+            createTime=int(time.time()),
+            msgId=in_msg.msgId,
+            content=chat_history.response_body)
+        return out_msg.to_xml_str()
 
     @staticmethod
     def is_asking_chatgpt(text):
@@ -85,29 +130,47 @@ class Handler:
         out_msg = completion.choices[0].message.content
         return out_msg
 
-    def parse_xml(self, web_data, encrypt_type, encodingAESKey, expected_app_id):
-        if len(web_data) == 0:
+    @staticmethod
+    def parse_msg_xml(text, encrypt_type):
+        if len(text) == 0:
             return None
-        xmlData = ET.fromstring(web_data)
+        print(f'xml text = {text}')
+        xml_data = ET.fromstring(text)
+        if xml_data is None:
+            print(f"Invalid XML: '{text}'")
+            return None
 
         if encrypt_type == 'aes':
-            if xmlData.find('Encrypt') != None:
-                xmlData = self.decrypt_msg(encodingAESKey, xmlData.find('Encrypt').text, expected_app_id)
-                print('Decrypted XML: ', ET.tostring(xmlData, encoding='utf-8', method='xml'))
+            if xml_data.find('Encrypt') is None:
+                print(f"Invalid XML: Encrypt element missing! (XML: '{text}')")
+                return None
+            
+            encodingAESKey = os.getenv('WX_ENCODING_AES_KEY')
+            appId = os.getenv('WX_APP_ID')
+            decrypted_text = Handler.decrypt_msg(encodingAESKey, xml_data.find('Encrypt').text, appId)
+            if decrypted_text is None:
+                return None
+            print(f'xml text (decrypted) = {decrypted_text}')
+            xml_data = ET.fromstring(decrypted_text)
+            if xml_data is None:
+                print(f"Invalid XML (decrypted): '{text}'")
+                return None
 
-        msg_type_element = xmlData.find('MsgType')
-        if msg_type_element is not None:
-            msg_type = msg_type_element.text
-            if msg_type == 'text':
-                return TextMsg(xmlData=xmlData)
-            elif msg_type == 'image':
-                return ImageMsg(xmlData=xmlData)
+        if xml_data.find('MsgType') is None:
+            print(f"Invalid XML: MsgType element missing! (XML: '{text}')")
+            return None
+
+        msg_type = xml_data.find('MsgType').text
+        if msg_type == 'text':
+            return TextMsg.from_xml_str(xml_data)
+        elif msg_type == 'image':
+            return ImageMsg.from_xml(xml_data)
         else:
-            print("MsgType element not found in the XML.")
+            print(f"Invalid MsgType value: {msg_type}")
+            return None
 
-        return None
-
-    def decrypt_msg(self, encodingAESKey, encrypted_data_b64, expected_app_id):
+    @staticmethod
+    def decrypt_msg(encodingAESKey, encrypted_data_b64, expected_app_id):
         encrypted_data = base64.b64decode(encrypted_data_b64)
 
         iv = encrypted_data[:16]
@@ -128,9 +191,10 @@ class Handler:
         if from_appid != expected_app_id:
             print("App ID mismatch! (expected: '{}', actual: '{}')".format(expected_app_id, from_appid))
 
-        return ET.fromstring(xml_content)
+        return xml_content
 
-    def encrypt_msg(self, plain_msg, token, timestamp, msg_signature, nonce, encodingAESKey, appId, toUserName, fromUserName):
+    @staticmethod
+    def encrypt_msg(plain_msg, token, timestamp, msg_signature, nonce, encodingAESKey, appId, toUserName, fromUserName):
         print(f'encrypt_msg({plain_msg}, {token}, {timestamp}, {msg_signature}, {nonce}, {encodingAESKey}, {appId})')
         try:
             key = base64.b64decode(encodingAESKey + "=")
@@ -184,73 +248,90 @@ class Handler:
         resp_xml = AES_TEXT_RESPONSE_TEMPLATE % resp_dict
         return resp_xml
 
-class Msg(object):
-    def __init__(self, xmlData=None):
-        if xmlData is not None:
-            self.ToUserName = self.get_element_text(xmlData, 'ToUserName')
-            self.FromUserName = self.get_element_text(xmlData, 'FromUserName')
-            self.CreateTime = self.get_element_text(xmlData, 'CreateTime')
-            self.MsgType = self.get_element_text(xmlData, 'MsgType')
-            self.MsgId = self.get_element_text(xmlData, 'MsgId')
+class Msg:
+    def __init__(self, toUser, fromUser, createTime, msgId, msgType) -> None:
+        self.toUser = toUser
+        self.fromUser = fromUser
+        self.createTime = createTime
+        self.msgId = msgId
+        self.msgType = msgType
 
-    def send(self):
-        return "success"
+    def __str__(self) -> str:
+        return f"Msg(toUser={self.toUser}, fromUser={self.fromUser}, createTime={self.createTime}, msgId={self.msgId}, msgType={self.msgType})"
 
     @staticmethod
-    def get_element_text(xmlData, tag):
-        element = xmlData.find(tag)
+    def get_xml_element_text(xml_data, tag):
+        element = xml_data.find(tag)
         if element is not None:
             return element.text
-        return None  # or return some default value or empty string
+        return None
 
 class TextMsg(Msg):
-    def __init__(self, toUserName=None, fromUserName=None, content=None, xmlData=None):
-        if xmlData is not None:
-            super().__init__(xmlData)
-            content = self.get_element_text(xmlData, 'Content')
-            self.Content = content.encode("utf-8") if content is not None else None
-        else:
-            self.__dict = dict()
-            self.__dict['ToUserName'] = toUserName
-            self.__dict['FromUserName'] = fromUserName
-            self.__dict['CreateTime'] = int(time.time())
-            self.__dict['Content'] = content
+    def __init__(self, toUser, fromUser, createTime, msgId, content) -> None:
+        super().__init__(toUser, fromUser, createTime, msgId, 'text')
+        self.content = content
 
-    def send(self):
-        XmlForm = """
-            <xml>
-                <ToUserName><![CDATA[{ToUserName}]]></ToUserName>
-                <FromUserName><![CDATA[{FromUserName}]]></FromUserName>
-                <CreateTime>{CreateTime}</CreateTime>
-                <MsgType><![CDATA[text]]></MsgType>
-                <Content><![CDATA[{Content}]]></Content>
-            </xml>
-            """
-        return XmlForm.format(**self.__dict)
+    def __str__(self) -> str:
+        return f"TextMsg(toUser={self.toUser}, fromUser={self.fromUser}, createTime={self.createTime}, msgId={self.msgId}, content={self.content})"
+
+    @staticmethod
+    def from_xml_str(xml_data) -> 'TextMsg':
+        assert xml_data.find('MsgType') is not None
+        assert xml_data.find('MsgType').text == 'text'
+        assert xml_data.find('Content') is not None
+        return TextMsg(
+            toUser=Msg.get_xml_element_text(xml_data, 'ToUserName'),
+            fromUser=Msg.get_xml_element_text(xml_data, 'FromUserName'),
+            createTime=Msg.get_xml_element_text(xml_data, 'CreateTime'),
+            msgId=Msg.get_xml_element_text(xml_data, 'MsgId'),
+            content=Msg.get_xml_element_text(xml_data, 'Content')
+        )
+
+    def to_xml_str(self) -> str:
+        content = self.content
+        max_text_size = 300
+        if len(content) > max_text_size:
+            text = '...\n\n（消息过长，已截断）'
+            content = content[:(max_text_size - len(text))] + text
+        return f"""<xml>
+    <ToUserName><![CDATA[{self.toUser}]]></ToUserName>
+    <FromUserName><![CDATA[{self.fromUser}]]></FromUserName>
+    <CreateTime>{self.createTime}</CreateTime>
+    <MsgType><![CDATA[text]]></MsgType>
+    <Content><![CDATA[{content}]]></Content>
+</xml>"""
 
 class ImageMsg(Msg):
-    def __init__(self, toUserName=None, fromUserName=None, mediaId=None, xmlData=None):
-        if xmlData is not None:
-            super().__init__(xmlData)
-            self.PicUrl = xmlData.find('PicUrl').text
-            self.MediaId = xmlData.find('MediaId').text
-        else:
-            self.__dict = dict()
-            self.__dict['ToUserName'] = toUserName
-            self.__dict['FromUserName'] = fromUserName
-            self.__dict['CreateTime'] = int(time.time())
-            self.__dict['MediaId'] = mediaId
+    def __init__(self, toUser, fromUser, createTime, msgId, picUrl, mediaId) -> None:
+        super().__init__(toUser, fromUser, createTime, msgId, 'image')
+        self.picUrl = picUrl
+        self.mediaId = mediaId
 
-    def send(self):
-        XmlForm = """
-            <xml>
-                <ToUserName><![CDATA[{ToUserName}]]></ToUserName>
-                <FromUserName><![CDATA[{FromUserName}]]></FromUserName>
-                <CreateTime>{CreateTime}</CreateTime>
-                <MsgType><![CDATA[image]]></MsgType>
-                <Image>
-                <MediaId><![CDATA[{MediaId}]]></MediaId>
-                </Image>
-            </xml>
-            """
-        return XmlForm.format(**self.__dict)
+    def __str__(self) -> str:
+        return f"TextMsg(toUser={self.toUser}, fromUser={self.fromUser}, createTime={self.createTime}, msgId={self.msgId}, picUrl={self.picUrl}, mediaId={self.mediaId})"
+
+    @staticmethod
+    def from_xml(xml_data) -> 'ImageMsg':
+        assert xml_data.find('MsgType') is not None
+        assert xml_data.find('MsgType').text == 'image'
+        assert xml_data.find('PicUrl') is not None
+        assert xml_data.find('MediaId') is not None
+        return ImageMsg(
+            toUser=Msg.get_xml_element_text(xml_data, 'ToUserName'),
+            fromUser=Msg.get_xml_element_text(xml_data, 'FromUserName'),
+            createTime=Msg.get_xml_element_text(xml_data, 'CreateTime'),
+            msgId=Msg.get_xml_element_text(xml_data, 'MsgId'),
+            picUrl=Msg.get_xml_element_text(xml_data, 'PicUrl'),
+            mediaId=Msg.get_xml_element_text(xml_data, 'MediaId')
+        )
+
+    def to_xml_str(self) -> str:
+        return f"""<xml>
+    <ToUserName><![CDATA[{self.toUser}]]></ToUserName>
+    <FromUserName><![CDATA[{self.fromUser}]]></FromUserName>
+    <CreateTime>{self.createTime}</CreateTime>
+    <MsgType><![CDATA[image]]></MsgType>
+    <Image>
+    <MediaId><![CDATA[{self.mediaId}]]></MediaId>
+    </Image>
+</xml>"""
